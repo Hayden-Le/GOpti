@@ -1,0 +1,9 @@
+# Ignore big and/or sensitive files
+*.sqlite3
+*.db
+*.env
+*.log
+*.pem
+*.key
+*.crt
+./venv/
