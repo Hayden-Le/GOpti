@@ -5,3 +5,6 @@ pydantic
 tzdata
 python-dotenv
 ortools
+httpx
+pytest
+

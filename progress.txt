@@ -1,0 +1,132 @@
+GOpti — Progress Summary & Next Steps
+====================================
+
+What’s done so far
+------------------
+1) Data & Database
+   - Dockerized PostgreSQL is running (user=db: gopti/gopti), host port mapped to 5433 to avoid local port conflicts.
+   - Schema created with three core tables:
+       • venues(id, name, address, lat, lng)
+       • events(id, venue_id, event_name, event_type, url, short_description, artist, require_booking, booking_detail, subactivity_times, min_dwell_min, max_dwell_min)
+       • event_sessions(id, event_id, start_ts, end_ts, duration_min)
+   - Sargable index added for performance:
+       • CREATE INDEX idx_event_sessions_start_ts ON event_sessions (start_ts);
+   - CSV ingestion pipeline implemented (db/ingest.py):
+       • Parses JSON-ish columns (location_coord, session_times, subactivity_times).
+       • Upserts venues and events (stable IDs from event_name|url; venues from name|address).
+       • Creates per-day session rows from session_times.
+       • Fixed “overnight windows” (end <= start) by rolling end forward +1 day.
+
+2) API (FastAPI) – Stable & Tested
+   - /health → returns { ok: true }.
+   - /events?date=YYYY-MM-DD → returns events + sessions on the given date.
+       • Query rewritten to use date RANGE (sargable) instead of casting:
+         WHERE s.start_ts >= $date::date AND s.start_ts < ($date::date + INTERVAL '1 day')
+       • Optional LIMIT parameter and reduced columns for lighter responses.
+   - /solve (two modes):
+       • Greedy stub (default): straight-line walking, respects session windows + dwell.
+         - Chooses first feasible session per requested event, in request order.
+         - Returns route[], dropped[], metrics{}.
+       • OR-Tools optimal (optional): TSP with Time Windows and disjunctions (at-most-one session per event).
+         - Flagged with USE_ORTOOLS=1; wrapper auto-falls back to stub on errors.
+   - Configured via DATABASE_URL env; connection timeout added; service verified end-to-end.
+
+3) Operational fixes & hygiene
+   - Resolved password/role mismatches and persistent volume state by reiniting the DB.
+   - Resolved port conflicts (5432) by re-mapping container to 5433 and updating DSN.
+   - PowerShell / large JSON ergonomics: advised saving to file or limiting results.
+   - Added quick troubleshooting steps for IPv4/port checks and DSN visibility.
+
+Quick test recipe (currently works)
+-----------------------------------
+1) List events:  GET /events?date=2023-06-11&limit=500
+2) Filter evening sessions (>= 18:00 AEST == 08:00Z) client-side.
+3) POST /solve with 3–4 nearby evening events; expect route + dropped.
+   - Known-good single: “The Last Ocean” on 2023-06-11 (18:00–23:00).
+
+Next steps (detailed plan)
+--------------------------
+Phase A — Backend Solver (Complete the engine)
+  [ ] Solidify OR-Tools
+      - Extract OR-Tools code into solve_ortools() module with unit tests.
+      - Enforce horizon (endTime - start.time), service times, and time windows already present.
+      - Tune drop penalty; prefer visiting more events vs. tiny walk savings.
+      - Return explicit “reasons” for dropped events (e.g., too-late-arrival, back-to-back conflict).
+  [ ] Real travel times
+      - Add Matrix provider (Mapbox or OpenRouteService) for walking durations.
+      - Implement matrix_cache table (keyed by provider+rounded coords+mode+date_bucket).
+      - Fallback to straight-line if provider fails; record which legs used which source.
+  [ ] Directions polylines (for map)
+      - For the final ordered route, fetch per-leg Directions and return encoded polylines.
+      - Add directions_cache (A->B key) with duration + polyline TTL.
+  [ ] Dwell strategy
+      - Support per-event dwell overrides in the request and defaults from events.min_dwell_min.
+      - Optional “compress dwell to min” mode when windows are tight.
+  [ ] Input validation & errors
+      - Pydantic schemas (already in place) + clearer 4xx on invalid input.
+      - Add a lightweight /debug/solve that echoes intermediate solver nodes for inspection.
+
+Phase B — Data & API Extensions
+  [ ] Add trips & trip_events tables
+      - trips(id, created_at, start_lat, start_lng, start_ts, end_ts, preferences_json)
+      - trip_events(trip_id, event_id, seq, arrive_ts, depart_ts, travel_sec_from_prev, status)
+  [ ] Persist solutions
+      - POST /api/trips (save request + solver output), GET /api/trips/{id}
+      - Shareable ID for read-only retrieval.
+  [ ] ICS export
+      - GET /api/trips/{id}.ics that generates an iCalendar file of the itinerary.
+  [ ] UX-friendly fields
+      - Add start_local/end_local to /events (Sydney TZ) to reduce client-side conversions.
+      - Optional filters: by bbox, category, “evening only”, etc.
+
+Phase C — Frontend MVP (Next.js)
+  [ ] Pages
+      - /plan: date picker, start/end time, map click to set start, event list with filters.
+      - /trip/[id]: itinerary timeline + map with polylines.
+  [ ] Components
+      - EventCard, Map (Mapbox GL), PreferencesDrawer, Timeline, Toasts.
+  [ ] Data fetching
+      - TanStack Query hooks for /events, /solve, /trips.
+  [ ] Interactions
+      - Select events → POST /solve → show timeline & map; re-solve with preference changes.
+      - Export .ics; copy share link.
+  [ ] Styling & DX
+      - Tailwind + shadcn/ui; loading skeletons; dark mode.
+
+Phase D — Hardening & Ops
+  [ ] Caching & rate limits
+      - Rate-limit /solve per IP; revalidation for /events.
+      - Warm common matrices (popular venues) via a background script.
+  [ ] Testing
+      - Unit tests: time-window math, dwell logic, matrix provider, caches.
+      - Golden tests: small synthetic city with known optimal results.
+      - Contract tests: ensure SolveRequest/Response don’t drift.
+  [ ] Observability
+      - Sentry for API; simple Prom metrics (solve_ms, visited, dropped).
+      - Structured logs (trip_id correlation; cache hits/misses).
+  [ ] Security & misc
+      - Input sanitization; cap N events per request.
+      - Secrets management for API keys.
+
+Acceptance criteria (for the next milestone)
+--------------------------------------------
+- POST /solve (ORTools mode) returns in < ~1–2s for 8–12 selected events (with cached matrix).
+- Route includes per-leg travelSecFromPrev using real walking durations and polylines.
+- Dropped list includes machine-readable “reason” codes.
+- A trip can be saved and reopened by share link; .ics import works in Google/Apple Calendar.
+- Minimal Next.js UI allows planning a route end-to-end (pick events → solve → view map/timeline → export).
+
+Risks & mitigations
+-------------------
+- Routing API costs/quotas → aggressive caching and precomputation; straight-line fallback.
+- Infeasible combinations → graceful dropping with clear reasons and UX coaching.
+- Performance with large N → cap selection size for MVP; matrix caching; time limits on solver.
+- Timezone pitfalls → store in UTC in DB; present Sydney-local on the API; test overnight windows.
+
+Short “what’s next” checklist
+-----------------------------
+[ ] Implement matrix provider + cache (back-end only).
+[ ] Return polylines for solved routes.
+[ ] Trip persistence + .ics export.
+[ ] Next.js MVP (/plan and /trip/[id]).
+[ ] Basic tests and Sentry wiring.
